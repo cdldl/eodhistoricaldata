@@ -1,6 +1,7 @@
 ### FIXME
 # Make a diff of the folder and download what's missing
 # Batch downloads with estimated time displayed + space
+# Change the directory + download only Common Stock
 ###
 
 list.of.packages <- c("data.table","RCurl","jsonlite","httr","bit64","doMC")
@@ -8,11 +9,13 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, require, character.only = TRUE)
 
-api_token = 'YOUR-TOKEN'
-path_output = "/home/cyril/eod2023/data/"
-global_api_daily_limit = 100000
+api_token = 'YOUR_API'
+path_output = "YOUR_FOLDER"
+daily_limit = fromJSON(getURL(paste0('https://eodhistoricaldata.com/api/user/?api_token=', 
+                                     api_token)))
+global_api_daily_limit = daily_limit$dailyRateLimit - daily_limit$apiRequests
 global_api_minute_limit = 2000
-cores = detectCores()
+cores = detectCores() - 10
 
 get_exchanges = function() {
   api_call_count = 1
@@ -145,39 +148,84 @@ if(write_to_disk) fwrite(data, paste0(path_output,
 
 get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
   api_call_count = 1
-
+  max_ticker_per_batch = 500
+  rate_limit = global_api_minute_limit
+  batch_size = min(max_ticker_per_batch, global_api_minute_limit/api_call_count)
+  
   # Check if already saved
   if(!overwrite) {
     already_output = list.files(paste0(path_output,exchange),full.names=T) 
     to_output = paste0(path_output,exchange,'/',tickers,'.csv')
     tickers = tickers[!to_output %in% already_output]
   }
-  
-  # Create batch
-  batch_size = global_api_minute_limit/api_call_count
-  ticker_batches <- split(tickers, ceiling(seq_along(tickers) / batch_size))
-  
-  for(i in seq(ticker_batches)) {
-    if(global_api_daily_limit < 0) return('API limit reached')
-    
-    ticker_batch = ticker_batches[[i]]
-    url_batch = paste0('https://eodhistoricaldata.com/api/eod/',
-                          ticker_batch,'.', exchange,'?api_token=')
-    
-    response = getURL(paste0(url_batch,api_token))
-    if(length(ticker_batches) > 1 & (i != length(ticker_batches))) Sys.sleep(60)
-    global_api_daily_limit = global_api_daily_limit - 
-      length(url_batch) * api_call_count
-    
-    eods = mclapply(1:length(url_batch),
-         function(i) {x = fread(response[i])
-         x[,ticker:=ticker_batch[i]]
-if(write_to_disk) fwrite(x, paste0(path_output,exchange,'/',ticker_batch[i],'.csv'))
-         x
-         }, mc.cores=cores)
-    eods = do.call(rbind,eods)
+
+  all_eods = data.table()
+  while(length(tickers)) {
+    # Create batch
+    ticker_batches <- split(tickers, ceiling(seq_along(tickers) / batch_size))
+    tickers = NULL
+    i =1
+    # check the bad urls
+    while(i <= length(ticker_batches)) {
+      if(global_api_daily_limit < 0) return('API limit reached')
+      
+      # Make ticker batch
+      ticker_batch = ticker_batches[[i]]
+      url_batch = paste0('https://eodhistoricaldata.com/api/eod/',
+                            ticker_batch,'.', exchange,'?api_token=')
+      
+      response = getURL(paste0(url_batch,api_token),header=T)
+      minute_last_request = as.POSIXlt(Sys.time())$min
+      
+      # Process responses
+      results = mclapply(1:length(response),function(i) {
+          #print(i)
+          x= response[i]
+          headers <- strsplit(x, "\r\n")[[1]]
+          # Get the rate limit
+          rate_limit <- grep("^X-RateLimit-Remaining:", headers[1:(length(headers)-1)], value = TRUE)
+          rate_limit = as.numeric(gsub('X-RateLimit-Remaining: ',"",rate_limit))
+          # Check if ticker has to be done again
+          redo = F
+          if(length(grep('429 Too Many Requests', headers[length(headers)])) 
+             | headers[length(headers)] %in% c("</html>",'')) redo = T
+          
+          # Get data
+          ticker_name = strsplit(names(x),'/|[.]')[[1]][7]
+          data = tryCatch(fread(headers[length(headers)]), error = function(e) e)
+          if(!is(data,'error')) {
+            data[,ticker:=ticker_name]
+            if(write_to_disk) fwrite(data, paste0(path_output,
+                                                  exchange,'/',ticker_name,'.csv'))
+            return(list(redo=redo,rate_limit=rate_limit, data=data))
+          } else {
+            return(list(redo=redo,rate_limit=rate_limit, data=data.table()))
+          }
+      }, mc.cores=cores)
+      
+      # Get the tickers that did not work
+      redos = sapply(results, function(x) x$redo)
+      tickers = c(tickers,do.call(rbind,strsplit(url_batch[which(redos==T)],'/|[.]'))[,7])
+      
+      # Update rate limit
+      rate_limits = sapply(results, function(x) x$rate_limit)
+      rate_limit = if(is(rate_limits, 'list')) min(c(rate_limit - batch_size, do.call(c,rate_limits))) else min(c(rate_limit - batch_size,rate_limits))
+      global_api_daily_limit = global_api_daily_limit - 
+        (batch_size - length(which(redos==T))) * api_call_count
+      
+      # Get data
+      eods = lapply(results, function(x) x$data)
+      eods = eods[sapply(eods,nrow) != 0]
+      all_eods = rbind(all_eods, do.call(rbind,eods))
+      
+      # Pause for minute API limit
+      while(rate_limit < batch_size & minute_last_request == as.POSIXlt(Sys.time())$min) {
+        Sys.sleep(1)
+      }
+      i = i + 1
+    }
   }
-  return(eods)
+  return(all_eods)
 }
 
 get_intra = function(exchange, tickers, starting_date = '2000-01-01',
@@ -230,17 +278,9 @@ main = function() {
     if(!file.exists(paste0(path_output,exch))) dir.create(paste0(path_output,exch),recursive=T)
     tickers = get_tickers(exch)$Code
     eods = get_eod(exch, tickers)
-    intras = get_intra(exch, tickers)
-    fund = get_fundamentals(exch, tickers)
+    #intras = get_intra(exch, tickers)
+    #fund = get_fundamentals(exch, tickers)
   }
 }
 
 main()
-
-if(F) {
-  #us_tickers = us_tickers[Type == 'Common Stock']$Code[1:10]
-  response = getURL(paste0(endpoint_eod,api_token),.encoding = "UTF-8", header = TRUE)
-  headers <- strsplit(response, "\r\n")[[1]]
-  rate_limit <- grep("^X-RateLimit-Remaining:", headers[1:(length(headers)-1)], value = TRUE)
-  rate_limit = as.numeric(gsub('X-RateLimit-Remaining: ',"",rate_limit))
-}
