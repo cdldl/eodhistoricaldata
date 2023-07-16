@@ -8,7 +8,7 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, require, character.only = TRUE)
 
-api_token = 'API-TOKEN'
+api_token = '61b967af5d0035.68435230'
 path_output = "/home/cyril/eod2023/data/"
 global_api_daily_limit = 100000
 global_api_minute_limit = 2000
@@ -92,8 +92,8 @@ get_fundamentals = function(exchange, tickers, write_to_disk=T, overwrite=F) {
   
   # Check if already saved
   if(!overwrite) {
-    already_output = list.files(paste0(path_output,exch),full.names=T) 
-    to_output = paste0(path_output,exch,'/',tickers,'.csv')
+    already_output = list.files(paste0(path_output,exchange),full.names=T) 
+    to_output = paste0(path_output,exchange,'/',tickers,'.csv')
     tickers = tickers[!to_output %in% already_output]
   }
   
@@ -148,8 +148,8 @@ get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
 
   # Check if already saved
   if(!overwrite) {
-    already_output = list.files(paste0(path_output,exch),full.names=T) 
-    to_output = paste0(path_output,exch,'/',tickers,'.csv')
+    already_output = list.files(paste0(path_output,exchange),full.names=T) 
+    to_output = paste0(path_output,exchange,'/',tickers,'.csv')
     tickers = tickers[!to_output %in% already_output]
   }
   
@@ -227,7 +227,7 @@ if(write_to_disk) fwrite(x, paste0(path_output,exch,ticker_name,'_intra.csv'), a
 main = function() {
   exchanges = get_exchanges()$Code
   for(exch in exchanges) {
-    dir.create(paste0(path_output,exch),recursive=T)
+    if(!file.exists(paste0(path_output,exch))) dir.create(paste0(path_output,exch),recursive=T)
     tickers = get_tickers(exch)$Code
     eods = get_eod(exch, tickers)
     intras = get_intra(exch, tickers)
