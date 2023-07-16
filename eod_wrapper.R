@@ -1,8 +1,6 @@
 ### FIXME
+# Make a diff of the folder and download what's missing
 # Batch downloads with estimated time displayed + space
-# deal with response errors: if error retry later or continue next batch 
-# Function to write to disk
-# Add from and to for intra
 ###
 
 list.of.packages <- c("data.table","RCurl","jsonlite","httr","bit64","doMC")
@@ -11,6 +9,7 @@ if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, require, character.only = TRUE)
 
 api_token = '61b967af5d0035.68435230'
+path_output = "/home/cyril/eod2023/data/"
 global_api_daily_limit = 100000
 global_api_minute_limit = 2000
 cores = detectCores()
@@ -40,10 +39,11 @@ get_tickers = function(exchange) {
 } 
 
 parseRawFundamentals = function(df) {
+  # df= copy(earn)
   df2 = data.table()
   for (col in names(df)) {
     df[,paste0(col):=lapply(get(col), function(x) replace(x, is.null(x), NA))]
-    raw = if( (is.character(df[[col]]) | is.na(df[[col]][1])) & length(df[[col]])<=1) df[[col]] else do.call(c,df[[col]])
+    raw = if( (is.numeric(df[[col]]) | is.character(df[[col]]) | is.na(df[[col]][1])) & length(df[[col]])<=1) df[[col]] else do.call(c,df[[col]])
     raw <- tryCatch(as.numeric(raw), warning = function(w) raw)
     df2[,paste0(col):=raw]
   }
@@ -51,6 +51,7 @@ parseRawFundamentals = function(df) {
 }
 
 getFundamentals <- function(fund_data) {
+  # fund_data = copy(parsed_data)
   bal <- t(fund_data$Financials$Balance_Sheet$quarterly)
   bal = as.data.table(do.call(rbind, bal))
   bal = parseRawFundamentals(bal)
@@ -85,9 +86,18 @@ getFundamentals <- function(fund_data) {
   return(df)
 }
 
-get_fundamentals = function(exchange, tickers) {
+get_fundamentals = function(exchange, tickers, write_to_disk=T, overwrite=F) {
   # exchange = 'US'; tickers = us_tickers #[Type == 'Common Stock']$Code[1:1001]
   api_call_count = 10
+  
+  # Check if already saved
+  if(!overwrite) {
+    already_output = list.files(paste0(path_output,exch),full.names=T) 
+    to_output = paste0(path_output,exch,'/',tickers,'.csv')
+    tickers = tickers[!to_output %in% already_output]
+  }
+  
+  # Create batches
   batch_size = global_api_minute_limit/api_call_count
   ticker_batches <- split(tickers, ceiling(seq_along(tickers) / batch_size))
   
@@ -103,23 +113,26 @@ get_fundamentals = function(exchange, tickers) {
     global_api_daily_limit = global_api_daily_limit - length(url_batch) * api_call_count
     
     fundamentals = mclapply(1:length(url_batch),
-                          function(i) {
-                            parsed_data <- fromJSON(response[i])
+                          function(x) {
+                            parsed_data <- tryCatch(fromJSON(response[x]), 
+                                                    error = function(e) e)
+                            if(is(parsed_data,'error')) return(data.table())
                             data = getFundamentals(parsed_data)
-                            data[,ticker:=tickers[i]]
+                            data[,ticker:=tickers[x]]
                             data[,Sector:=parsed_data$General$Sector]
                             data[,Industry:=parsed_data$General$Industry]
                             data[,GicSector:=parsed_data$General$GicSector]
-                            data[,GicIndustry:=parsed_data$General$GicIndustry]},
-                          mc.cores = cores)
+                            data[,GicIndustry:=parsed_data$General$GicIndustry]
+if(write_to_disk) fwrite(data, paste0(path_output,
+                                      exchange,'/',tickers[x],'_fund.csv'))
+                            data},mc.cores = cores)
     all_fundamentals = append(all_fundamentals, fundamentals)
   }
   
   # Merge fundamentals
   all_cols <- unique(unlist(lapply(all_fundamentals, colnames)))
-  max_cols <- max(sapply(all_fundamentals, function(x) length(colnames(x))))
   all_fundamentals = lapply(all_fundamentals, function(x) {
-    if (length(colnames(x)) < max_cols) {
+    if (length(colnames(x)) < length(all_cols)) {
       missing_cols <- setdiff(all_cols,colnames(x))
       x[,paste0(missing_cols):=NA]
     }
@@ -130,8 +143,17 @@ get_fundamentals = function(exchange, tickers) {
   return(all_fundamentals)
 }
 
-get_eod = function(exchange, tickers) {
+get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
   api_call_count = 1
+
+  # Check if already saved
+  if(!overwrite) {
+    already_output = list.files(paste0(path_output,exch),full.names=T) 
+    to_output = paste0(path_output,exch,'/',tickers,'.csv')
+    tickers = tickers[!to_output %in% already_output]
+  }
+  
+  # Create batch
   batch_size = global_api_minute_limit/api_call_count
   ticker_batches <- split(tickers, ceiling(seq_along(tickers) / batch_size))
   
@@ -144,22 +166,27 @@ get_eod = function(exchange, tickers) {
     
     response = getURL(paste0(url_batch,api_token))
     if(length(ticker_batches) > 1 & (i != length(ticker_batches))) Sys.sleep(60)
-    global_api_daily_limit = global_api_daily_limit - length(url_batch) * api_call_count
+    global_api_daily_limit = global_api_daily_limit - 
+      length(url_batch) * api_call_count
     
     eods = mclapply(1:length(url_batch),
          function(i) {x = fread(response[i])
-         x[,ticker:=ticker_batch[i]]}, mc.cores=cores)
+         x[,ticker:=ticker_batch[i]]
+if(write_to_disk) fwrite(x, paste0(path_output,exchange,'/',ticker_batch[i],'.csv'))
+         x
+         }, mc.cores=cores)
     eods = do.call(rbind,eods)
   }
   return(eods)
 }
 
-get_intra = function(exchange, tickers) {
+get_intra = function(exchange, tickers, starting_date = '2000-01-01',
+                     end_date = Sys.time(), write_to_disk=T) {
   # exchange = 'US'; tickers = us_tickers#[Type == 'Common Stock']$Code[1:6]
   api_call_count = 5
   if(exchange == 'US') interval = '1m' else interval = '5m'
-  min_date = as.numeric(as.POSIXct('2000-01-01',tz='UTC'))
-  max_date = as.numeric(as.POSIXct(format(Sys.time(), tz = "UTC")))
+  min_date = as.numeric(as.POSIXct(starting_date,tz='UTC'))
+  max_date = as.numeric(as.POSIXct(format(end_date, tz = "UTC")))
   
   endpoint_intra = paste0('https://eodhistoricaldata.com/api/intraday/',
                           tickers,'.', exchange,'?api_token=')
@@ -184,7 +211,9 @@ get_intra = function(exchange, tickers) {
     intras = mclapply(1:length(url_batch),
                   function(i) {x = fread(response[i])
                   ticker_name = strsplit(url_batch[i],'/|[.]US')[[1]][6]
-                  x[,ticker:=ticker_name]}
+                  x[,ticker:=ticker_name]
+if(write_to_disk) fwrite(x, paste0(path_output,exch,ticker_name,'_intra.csv'), append = T)
+                  x}
                   ,mc.cores = cores)
     all_intras = append(all_intras, intras)
   }
@@ -196,15 +225,20 @@ get_intra = function(exchange, tickers) {
 }
 
 main = function() {
-  us_tickers = get_tickers('US')
-  us_tickers = us_tickers[Type == 'Common Stock']$Code
-  fundamentals = get_fundamentals('US', us_tickers)
-  fwrite(fundamentals, '~/fundamentals1.csv')
+  exchanges = get_exchanges()$Code
+  for(exch in exchanges) {
+    dir.create(paste0(path_output,exch),recursive=T)
+    tickers = get_tickers(exch)$Code
+    eods = get_eod(exch, tickers)
+    intras = get_intra(exch, tickers)
+    fund = get_fundamentals(exch, tickers)
+  }
 }
 
 main()
 
 if(F) {
+  #us_tickers = us_tickers[Type == 'Common Stock']$Code[1:10]
   response = getURL(paste0(endpoint_eod,api_token),.encoding = "UTF-8", header = TRUE)
   headers <- strsplit(response, "\r\n")[[1]]
   rate_limit <- grep("^X-RateLimit-Remaining:", headers[1:(length(headers)-1)], value = TRUE)
