@@ -8,7 +8,7 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, require, character.only = TRUE)
 
-api_token = '61b967af5d0035.68435230'
+api_token = 'API-TOKEN'
 path_output = "/home/cyril/eod2023/data/"
 global_api_daily_limit = 100000
 global_api_minute_limit = 2000
