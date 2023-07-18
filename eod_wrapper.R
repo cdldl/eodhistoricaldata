@@ -1,4 +1,5 @@
 ### FIXME
+# Measure the total time when it's over for eod.
 # Make a diff of the folder and download what's missing
 # Batch downloads with estimated time displayed + space
 # Change the directory + download only Common Stock
@@ -9,13 +10,13 @@ new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, require, character.only = TRUE)
 
-api_token = 'YOUR_API'
-path_output = "YOUR_FOLDER"
+api_token = 'YOUR-TOKEN'
+path_output = "YOUR-FOLDER"
+cores = detectCores() - 10
+global_api_minute_limit = 2000
 daily_limit = fromJSON(getURL(paste0('https://eodhistoricaldata.com/api/user/?api_token=', 
                                      api_token)))
 global_api_daily_limit = daily_limit$dailyRateLimit - daily_limit$apiRequests
-global_api_minute_limit = 2000
-cores = detectCores() - 10
 
 get_exchanges = function() {
   api_call_count = 1
@@ -147,6 +148,16 @@ if(write_to_disk) fwrite(data, paste0(path_output,
 }
 
 get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
+  #write_to_disk=T; overwrite=F
+  
+  if(length(tickers)>100) {
+    load_on_disk = F
+    write_to_disk = T
+    print('writing to disk instead because length(tickers) > 100')
+  } else {
+    load_on_disk = T
+  }
+
   api_call_count = 1
   max_ticker_per_batch = 500
   rate_limit = global_api_minute_limit
@@ -164,7 +175,7 @@ get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
     # Create batch
     ticker_batches <- split(tickers, ceiling(seq_along(tickers) / batch_size))
     tickers = NULL
-    i =1
+    i = 1
     # check the bad urls
     while(i <= length(ticker_batches)) {
       if(global_api_daily_limit < 0) return('API limit reached')
@@ -180,6 +191,7 @@ get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
       # Process responses
       results = mclapply(1:length(response),function(i) {
           #print(i)
+        tryCatch({
           x= response[i]
           headers <- strsplit(x, "\r\n")[[1]]
           # Get the rate limit
@@ -188,10 +200,10 @@ get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
           # Check if ticker has to be done again
           redo = F
           if(length(grep('429 Too Many Requests', headers[length(headers)])) 
-             | headers[length(headers)] %in% c("</html>",'')) redo = T
-          
+             | headers[length(headers)] %in% c("</html>",'')) return(list(redo=T,rate_limit=rate_limit, data=data.table()))
+          if(length(grep('Ticker Not Found', headers[length(headers)]))) return(list(redo=F,rate_limit=rate_limit, data=data.table()))
           # Get data
-          ticker_name = strsplit(names(x),'/|[.]')[[1]][7]
+          ticker_name = strsplit(url_batch[i],'/|[.]')[[1]][7]
           data = tryCatch(fread(headers[length(headers)]), error = function(e) e)
           if(!is(data,'error')) {
             data[,ticker:=ticker_name]
@@ -201,22 +213,30 @@ get_eod = function(exchange, tickers, write_to_disk=T, overwrite=F) {
           } else {
             return(list(redo=redo,rate_limit=rate_limit, data=data.table()))
           }
+        }, error = function(e) {
+            return(list(redo=T,rate_limit=NA, data=data.table()))
+          })
       }, mc.cores=cores)
-      
+        
       # Get the tickers that did not work
-      redos = sapply(results, function(x) x$redo)
+      if(class(results) == 'vector') {
+        tickers = c(tickers,do.call(rbind,strsplit(url_batch,'/|[.]'))[,7])
+        i = i +1
+        next()
+      } 
+      redos = tryCatch(sapply(results, function(x) x$redo), error = function(e) rep(T, length(response)))
       tickers = c(tickers,do.call(rbind,strsplit(url_batch[which(redos==T)],'/|[.]'))[,7])
       
       # Update rate limit
       rate_limits = sapply(results, function(x) x$rate_limit)
-      rate_limit = if(is(rate_limits, 'list')) min(c(rate_limit - batch_size, do.call(c,rate_limits))) else min(c(rate_limit - batch_size,rate_limits))
+      rate_limit = if(is(rate_limits, 'list')) min(c(rate_limit - batch_size, do.call(c,rate_limits)),na.rm=T) else min(c(rate_limit - batch_size,rate_limits),na.rm=T)
       global_api_daily_limit = global_api_daily_limit - 
         (batch_size - length(which(redos==T))) * api_call_count
       
       # Get data
       eods = lapply(results, function(x) x$data)
       eods = eods[sapply(eods,nrow) != 0]
-      all_eods = rbind(all_eods, do.call(rbind,eods))
+      if(load_on_disk == T) all_eods = rbind(all_eods, do.call(rbind,eods))
       
       # Pause for minute API limit
       while(rate_limit < batch_size & minute_last_request == as.POSIXlt(Sys.time())$min) {
@@ -273,13 +293,16 @@ if(write_to_disk) fwrite(x, paste0(path_output,exch,ticker_name,'_intra.csv'), a
 }
 
 main = function() {
-  exchanges = get_exchanges()$Code
-  for(exch in exchanges) {
-    if(!file.exists(paste0(path_output,exch))) dir.create(paste0(path_output,exch),recursive=T)
-    tickers = get_tickers(exch)$Code
-    eods = get_eod(exch, tickers)
-    #intras = get_intra(exch, tickers)
-    #fund = get_fundamentals(exch, tickers)
+  exchanges = get_exchanges()
+  for(exchange in exchanges$Code) {
+    print(exchange)
+    if(!file.exists(paste0(path_output,exchange))) dir.create(paste0(path_output,exchange),recursive=T)
+    tickers = get_tickers(exchange)
+    if(length(tickers)) {
+      eods = get_eod(exchange, tickers$Code)
+      #fund = get_fundamentals(exchange, tickers[Type == 'Common Stock']$Code)
+      #intras = get_intra(exchange, tickers$Code)
+    } 
   }
 }
 
